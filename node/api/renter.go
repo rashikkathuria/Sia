@@ -319,6 +319,28 @@ func (api *API) renterContractsHandler(w http.ResponseWriter, _ *http.Request, _
 	})
 }
 
+// renterClearDownloadsHandler handles the API call to request the download queue.
+func (api *API) renterClearDownloadsHandler(w http.ResponseWriter, _ *http.Request, _ httprouter.Params) {
+	err := api.renter.ClearDownloadHistory()
+	if err != nil {
+		WriteError(w, Error{err.Error()}, http.StatusBadRequest)
+		return
+	}
+
+	WriteSuccess(w)
+}
+
+// renterClearDownloadHandler handles the API call to request the download queue.
+func (api *API) renterClearDownloadHandler(w http.ResponseWriter, _ *http.Request, ps httprouter.Params) {
+	err := api.renter.RemoveFromDownloadHistory(strings.TrimPrefix(ps.ByName("siapath"), "/"))
+	if err != nil {
+		WriteError(w, Error{err.Error()}, http.StatusBadRequest)
+		return
+	}
+
+	WriteSuccess(w)
+}
+
 // renterDownloadsHandler handles the API call to request the download queue.
 func (api *API) renterDownloadsHandler(w http.ResponseWriter, _ *http.Request, _ httprouter.Params) {
 	var downloads []DownloadInfo
@@ -575,7 +597,7 @@ func (api *API) renterUploadHandler(w http.ResponseWriter, req *http.Request, ps
 	if req.FormValue("datapieces") != "" || req.FormValue("paritypieces") != "" {
 		// Check that both values have been supplied.
 		if req.FormValue("datapieces") == "" || req.FormValue("paritypieces") == "" {
-			WriteError(w, Error{"must provide both the datapieces paramaeter and the paritypieces parameter if specifying erasure coding parameters"}, http.StatusBadRequest)
+			WriteError(w, Error{"must provide both the datapieces parameter and the paritypieces parameter if specifying erasure coding parameters"}, http.StatusBadRequest)
 			return
 		}
 
