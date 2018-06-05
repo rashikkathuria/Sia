@@ -104,7 +104,7 @@ package renter
 // That's going to need to be changed to a partial sector. This is probably
 // going to result in downloading that's 64-byte aligned instead of perfectly
 // byte-aligned. Further, the encryption and erasure coding may also have
-// alignment requirements which interefere with how the call to Sector can work.
+// alignment requirements which interfere with how the call to Sector can work.
 // So you need to make sure that in 'managedDownload' you download at least
 // enough data to fit the alignment requirements of all 3 steps (download from
 // host, encryption, erasure coding). After the logical data has been recovered,
@@ -332,7 +332,7 @@ func (r *Renter) managedDownload(p modules.RenterDownloadParameters) (*download,
 
 	// Add the download object to the download queue.
 	r.downloadHistoryMu.Lock()
-	r.downloadHistory = append(r.downloadHistory, d)
+	r.downloadHistory[d.destinationString] = d
 	r.downloadHistoryMu.Unlock()
 
 	// Return the download object
@@ -491,11 +491,11 @@ func (r *Renter) DownloadHistory() []modules.DownloadInfo {
 	defer r.downloadHistoryMu.Unlock()
 
 	downloads := make([]modules.DownloadInfo, len(r.downloadHistory))
-	for i := range r.downloadHistory {
+	i := 0
+	for _, d := range r.downloadHistory {
 		// Order from most recent to least recent.
-		d := r.downloadHistory[len(r.downloadHistory)-i-1]
 		d.mu.Lock() // Lock required for d.endTime only.
-		downloads[i] = modules.DownloadInfo{
+		downloads[len(r.downloadHistory)-1-i] = modules.DownloadInfo{
 			Destination:     d.destinationString,
 			DestinationType: d.staticDestinationType,
 			Length:          d.staticLength,
@@ -517,6 +517,31 @@ func (r *Renter) DownloadHistory() []modules.DownloadInfo {
 		} else {
 			downloads[i].Error = ""
 		}
+		i++
 	}
 	return downloads
+}
+
+// ClearDownloadHistory clears the renter's download history
+func (r *Renter) ClearDownloadHistory() error {
+	r.downloadHistoryMu.Lock()
+	defer r.downloadHistoryMu.Unlock()
+
+	for s := range r.downloadHistory {
+		err := r.removeFromDownloadHistory(s)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// removeFromDownloadHistory removes a provided download from
+// the download history
+func (r *Renter) removeFromDownloadHistory(destinationString string) error {
+	delete(r.downloadHistory, destinationString)
+	if _, ok := r.downloadHistory[destinationString]; ok {
+		return errors.New("Download not remove from history")
+	}
+	return nil
 }
