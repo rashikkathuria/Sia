@@ -127,6 +127,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -332,7 +333,7 @@ func (r *Renter) managedDownload(p modules.RenterDownloadParameters) (*download,
 
 	// Add the download object to the download queue.
 	r.downloadHistoryMu.Lock()
-	r.downloadHistory[d.staticSiaPath] = d
+	r.downloadHistory = append(r.downloadHistory, d)
 	r.downloadHistoryMu.Unlock()
 
 	// Return the download object
@@ -491,11 +492,11 @@ func (r *Renter) DownloadHistory() []modules.DownloadInfo {
 	defer r.downloadHistoryMu.Unlock()
 
 	downloads := make([]modules.DownloadInfo, len(r.downloadHistory))
-	i := 0
-	for _, d := range r.downloadHistory {
+	for i := range r.downloadHistory {
 		// Order from most recent to least recent.
+		d := r.downloadHistory[len(r.downloadHistory)-i-1]
 		d.mu.Lock() // Lock required for d.endTime only.
-		downloads[len(r.downloadHistory)-1-i] = modules.DownloadInfo{
+		downloads[i] = modules.DownloadInfo{
 			Destination:     d.destinationString,
 			DestinationType: d.staticDestinationType,
 			Length:          d.staticLength,
@@ -505,7 +506,7 @@ func (r *Renter) DownloadHistory() []modules.DownloadInfo {
 			Completed:            d.staticComplete(),
 			EndTime:              d.endTime,
 			Received:             atomic.LoadUint64(&d.atomicDataReceived),
-			StartTime:            d.staticStartTime,
+			StartTime:            d.staticStartTime.UnixNano(),
 			TotalDataTransferred: atomic.LoadUint64(&d.atomicTotalDataTransferred),
 		}
 		// Release download lock before calling d.Err(), which will acquire the
@@ -517,7 +518,6 @@ func (r *Renter) DownloadHistory() []modules.DownloadInfo {
 		} else {
 			downloads[i].Error = ""
 		}
-		i++
 	}
 	return downloads
 }
@@ -530,19 +530,59 @@ func (r *Renter) ClearDownloadHistory() error {
 	defer r.tg.Done()
 	r.downloadHistoryMu.Lock()
 	defer r.downloadHistoryMu.Unlock()
-	r.downloadHistory = make(map[string]*download)
+	r.downloadHistory = r.downloadHistory[:0]
 	return nil
 }
 
-// RemoveFromDownloadHistory removes a provided download from
-// the download history
-func (r *Renter) RemoveFromDownloadHistory(staticSiaPath string) error {
+// ClearDownloadHistoryAfter clears the download history after
+// the given timestamp
+func (r *Renter) ClearDownloadHistoryAfter(timestamp int64) error {
 	if err := r.tg.Add(); err != nil {
 		return err
 	}
 	defer r.tg.Done()
 	r.downloadHistoryMu.Lock()
 	defer r.downloadHistoryMu.Unlock()
-	delete(r.downloadHistory, staticSiaPath)
+	i := sort.Search(len(r.downloadHistory), func(i int) bool { return r.downloadHistory[i].staticStartTime.UnixNano() == timestamp })
+	if i >= len(r.downloadHistory) {
+		return errors.New("Timestamp not found in Download History")
+	}
+	r.downloadHistory = r.downloadHistory[:i]
+	return nil
+}
+
+// ClearDownloadHistoryBefore clears the download history before
+// the given timestamp
+func (r *Renter) ClearDownloadHistoryBefore(timestamp int64) error {
+	if err := r.tg.Add(); err != nil {
+		return err
+	}
+	defer r.tg.Done()
+	r.downloadHistoryMu.Lock()
+	defer r.downloadHistoryMu.Unlock()
+	i := sort.Search(len(r.downloadHistory), func(i int) bool { return r.downloadHistory[i].staticStartTime.UnixNano() == timestamp })
+	if i >= len(r.downloadHistory) {
+		return errors.New("Timestamp not found in Download History")
+	}
+	r.downloadHistory = r.downloadHistory[i+1:]
+	return nil
+}
+
+// RemoveFromDownloadHistory removes a provided download from
+// the download history
+func (r *Renter) RemoveFromDownloadHistory(staticSiaPath string, timestamp int64) error {
+	if err := r.tg.Add(); err != nil {
+		return err
+	}
+	defer r.tg.Done()
+	r.downloadHistoryMu.Lock()
+	defer r.downloadHistoryMu.Unlock()
+	i := sort.Search(len(r.downloadHistory), func(i int) bool {
+		return r.downloadHistory[i].staticSiaPath == staticSiaPath && r.downloadHistory[i].staticStartTime.UnixNano() == timestamp
+	})
+	if i >= len(r.downloadHistory) {
+		return errors.New("Download not found in Download History")
+	}
+	r.downloadHistory = append(r.downloadHistory[:i], r.downloadHistory[i+1:]...)
 	return nil
 }
