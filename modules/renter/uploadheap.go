@@ -23,6 +23,8 @@ import (
 
 	"github.com/NebulousLabs/Sia/build"
 	"github.com/NebulousLabs/Sia/crypto"
+	"github.com/NebulousLabs/Sia/modules/renter/siafile"
+	"github.com/NebulousLabs/Sia/types"
 )
 
 // uploadHeap contains a priority-sorted heap of all the chunks being uploaded
@@ -66,11 +68,11 @@ func (uch *uploadChunkHeap) Pop() interface{} {
 func (uh *uploadHeap) managedPush(uuc *unfinishedUploadChunk) {
 	// Create the unique chunk id.
 	ucid := uploadChunkID{
-		fileUID: uuc.renterFile.staticUID,
+		fileUID: uuc.renterFile.UID(),
 		index:   uuc.index,
 	}
 	// Sanity check: fileUID should not be the empty value.
-	if uuc.renterFile.staticUID == "" {
+	if uuc.renterFile.UID() == "" {
 		panic("empty string for file UID")
 	}
 
@@ -100,19 +102,15 @@ func (uh *uploadHeap) managedPop() (uc *unfinishedUploadChunk) {
 // TODO / NOTE: This code can be substantially simplified once the files store
 // the HostPubKey instead of the FileContractID, and can be simplified even
 // further once the layout is per-chunk instead of per-filecontract.
-func (r *Renter) buildUnfinishedChunks(f *file, hosts map[string]struct{}) []*unfinishedUploadChunk {
-	// Files are not threadsafe.
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
+func (r *Renter) buildUnfinishedChunks(f *siafile.SiaFile, hosts map[string]struct{}) []*unfinishedUploadChunk {
 	// If the file is not being tracked, don't repair it.
-	trackedFile, exists := r.persist.Tracking[f.name]
+	trackedFile, exists := r.persist.Tracking[f.SiaPath()]
 	if !exists {
 		return nil
 	}
 
 	// If we don't have enough workers for the file, don't repair it right now.
-	if len(r.workerPool) < f.erasureCode.MinPieces() {
+	if len(r.workerPool) < f.ErasureCode().MinPieces() {
 		return nil
 	}
 
@@ -121,7 +119,7 @@ func (r *Renter) buildUnfinishedChunks(f *file, hosts map[string]struct{}) []*un
 	// TODO / NOTE: Future files may have a different method for determining the
 	// number of chunks. Changes will be made due to things like sparse files,
 	// and the fact that chunks are going to be different sizes.
-	chunkCount := f.numChunks()
+	chunkCount := f.NumChunks()
 	newUnfinishedChunks := make([]*unfinishedUploadChunk, chunkCount)
 	for i := uint64(0); i < chunkCount; i++ {
 		newUnfinishedChunks[i] = &unfinishedUploadChunk{
@@ -129,13 +127,13 @@ func (r *Renter) buildUnfinishedChunks(f *file, hosts map[string]struct{}) []*un
 			localPath:  trackedFile.RepairPath,
 
 			id: uploadChunkID{
-				fileUID: f.staticUID,
+				fileUID: f.UID(),
 				index:   i,
 			},
 
 			index:  i,
-			length: f.staticChunkSize(),
-			offset: int64(i * f.staticChunkSize()),
+			length: f.ChunkSize(),
+			offset: int64(i * f.ChunkSize()),
 
 			// memoryNeeded has to also include the logical data, and also
 			// include the overhead for encryption.
@@ -146,13 +144,13 @@ func (r *Renter) buildUnfinishedChunks(f *file, hosts map[string]struct{}) []*un
 			// TODO: Currently we request memory for all of the pieces as well
 			// as the minimum pieces, but we perhaps don't need to request all
 			// of that.
-			memoryNeeded:  f.pieceSize*uint64(f.erasureCode.NumPieces()+f.erasureCode.MinPieces()) + uint64(f.erasureCode.NumPieces()*crypto.TwofishOverhead),
-			minimumPieces: f.erasureCode.MinPieces(),
-			piecesNeeded:  f.erasureCode.NumPieces(),
+			memoryNeeded:  f.PieceSize()*uint64(f.ErasureCode().NumPieces()+f.ErasureCode().MinPieces()) + uint64(f.ErasureCode().NumPieces()*crypto.TwofishOverhead),
+			minimumPieces: f.ErasureCode().MinPieces(),
+			piecesNeeded:  f.ErasureCode().NumPieces(),
 
-			physicalChunkData: make([][]byte, f.erasureCode.NumPieces()),
+			physicalChunkData: make([][]byte, f.ErasureCode().NumPieces()),
 
-			pieceUsage:  make([]bool, f.erasureCode.NumPieces()),
+			pieceUsage:  make([]bool, f.ErasureCode().NumPieces()),
 			unusedHosts: make(map[string]struct{}),
 		}
 		// Every chunk can have a different set of unused hosts.
@@ -161,59 +159,59 @@ func (r *Renter) buildUnfinishedChunks(f *file, hosts map[string]struct{}) []*un
 		}
 	}
 
-	// Iterate through the contracts of the file and mark which hosts are
-	// already in use for the chunk. As you delete hosts from the 'unusedHosts'
-	// map, also increment the 'piecesCompleted' value.
-	saveFile := false
-	for fcid, fileContract := range f.contracts {
-		pk := r.hostContractor.ResolveIDToPubKey(fcid)
-		recentContract, exists := r.hostContractor.ContractByPublicKey(pk)
-		contractUtility, exists2 := r.hostContractor.ContractUtility(pk)
-		if exists != exists2 {
-			build.Critical("got a contract without utility or vice versa which shouldn't happen",
-				exists, exists2)
-		}
-		if !exists || !exists2 {
-			// File contract does not seem to be part of the host anymore.
-			// Delete this contract and mark the file to be saved.
-			delete(f.contracts, fcid)
-			saveFile = true
-			continue
-		}
-		if !contractUtility.GoodForRenew {
-			// We are no longer renewing with this contract, so it does not
-			// count for redundancy.
-			continue
-		}
-		hpk := recentContract.HostPublicKey
+	// Build a map of host public keys.
+	pks := make(map[string]types.SiaPublicKey)
+	for _, pk := range f.HostPublicKeys() {
+		pks[string(pk.Key)] = pk
+	}
 
-		// Mark the chunk set based on the pieces in this contract.
-		for _, piece := range fileContract.Pieces {
-			_, exists := newUnfinishedChunks[piece.Chunk].unusedHosts[hpk.String()]
-			redundantPiece := newUnfinishedChunks[piece.Chunk].pieceUsage[piece.Piece]
+	// Iterate through the pieces of the file and mark which hosts are already
+	// in use for the chunk. As you delete hosts from the 'unusedHosts' map,
+	// also increment the 'piecesCompleted' value.
+	for i := uint64(0); i < f.NumChunks(); i++ {
+		for j := uint64(0); j < f.NumPieces(); j++ {
+			// Get the piece.
+			piece, err := f.Piece(i, j)
+			if err != nil {
+				r.log.Println("failed to get piece for building incomplete chunks")
+				return nil
+			}
+
+			// Get the contract for the piece.
+			pk, exists := pks[string(piece.HostPubKey.Key)]
+			if !exists {
+				build.Critical("Couldn't find public key in map. This should never happen")
+			}
+			contractUtility, exists2 := r.hostContractor.ContractUtility(pk)
+			if exists != exists2 {
+				build.Critical("got a contract without utility or vice versa which shouldn't happen",
+					exists, exists2)
+			}
+			if !exists || !exists2 {
+				// File contract does not seem to be part of the host anymore.
+				continue
+			}
+			if !contractUtility.GoodForRenew {
+				// We are no longer renewing with this contract, so it does not
+				// count for redundancy.
+				continue
+			}
+
+			// Mark the chunk set based on the pieces in this contract.
+			_, exists = newUnfinishedChunks[i].unusedHosts[pk.String()]
+			redundantPiece := newUnfinishedChunks[i].pieceUsage[j]
 			if exists && !redundantPiece {
-				newUnfinishedChunks[piece.Chunk].pieceUsage[piece.Piece] = true
-				newUnfinishedChunks[piece.Chunk].piecesCompleted++
-				delete(newUnfinishedChunks[piece.Chunk].unusedHosts, hpk.String())
+				newUnfinishedChunks[i].pieceUsage[j] = true
+				newUnfinishedChunks[i].piecesCompleted++
+				delete(newUnfinishedChunks[i].unusedHosts, pk.String())
 			} else if exists {
 				// This host has a piece, but it is the same piece another host
 				// has. We should still remove the host from the unusedHosts
 				// since one host having multiple pieces of a chunk might lead
 				// to unexpected issues.
-				delete(newUnfinishedChunks[piece.Chunk].unusedHosts, hpk.String())
+				delete(newUnfinishedChunks[i].unusedHosts, pk.String())
 			}
-		}
-	}
-	// If 'saveFile' is marked, it means we deleted some dead contracts and
-	// cleaned up the file a bit. Save the file to clean up some space on disk
-	// and prevent the same work from being repeated after the next restart.
-	//
-	// TODO / NOTE: This process isn't going to make sense anymore once we
-	// switch to chunk-based saving.
-	if saveFile {
-		err := r.saveFile(f)
-		if err != nil {
-			r.log.Println("error while saving a file after pruning some contracts from it:", err)
+
 		}
 	}
 
